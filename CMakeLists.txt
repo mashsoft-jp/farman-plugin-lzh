@@ -47,6 +47,12 @@ target_include_directories(LzhArchivePlugin PRIVATE
   ${CMAKE_SOURCE_DIR}/farman-sdk   # "core/IArchivePlugin.h" 等を解決
 )
 
+# project() の VERSION をプラグインの version() として埋め込む。
+# リリース時はこの CMakeLists の project(... VERSION x.y.z) を配布タグに合わせて更新する。
+target_compile_definitions(LzhArchivePlugin PRIVATE
+  LZH_PLUGIN_VERSION="${PROJECT_VERSION}"
+)
+
 target_link_libraries(LzhArchivePlugin PRIVATE
   Qt6::Core
   Qt6::Core5Compat                 # ArchiveEntryName の QTextCodec (Shift-JIS)

@@ -29,6 +29,15 @@ public:
   QString authorUrl()  const override {
     return QStringLiteral("https://www.mashsoft.co.jp");
   }
+  // 配布バージョン。CMake の project() VERSION を LZH_PLUGIN_VERSION として
+  // コンパイル時に埋め込む。未定義ビルド (手元の素朴なコンパイル等) では "dev"。
+  QString version()    const override {
+#ifdef LZH_PLUGIN_VERSION
+    return QStringLiteral(LZH_PLUGIN_VERSION);
+#else
+    return QStringLiteral("dev");
+#endif
+  }
   // farman 本体には同梱せず、外部プラグインとして別途配布する。外部プラグインは
   // priority 0〜9999 の範囲を使う (10000 以上は同梱公式の予約域で、外部ロード時に
   // 拒否される)。
