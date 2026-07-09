@@ -1,0 +1,221 @@
+# GitHub Actions: タグ push をトリガに 3 OS 分の LZH プラグインをビルドし、
+# GitHub Releases に draft として公開する。
+#
+#   トリガ:
+#     - `v*` 形式のタグ push (v1.0.0 など)
+#     - workflow_dispatch (GitHub UI から手動起動: 試運転用)
+#
+#   フロー:
+#     1. matrix で macOS(arm64) / Linux(x86_64) / Windows(x64) をビルド
+#     2. 成果物 (LzhArchivePlugin.{dylib,so,dll}) を release ジョブへ集約
+#     3. ファイル名にタグと OS を埋め込んで draft Release に添付
+#        → 中身を確認してから手動で Publish する運用
+#
+#   ★ABI 一致が必須: プラグインは farman 本体と同じ Qt / libarchive で
+#     ビルドしないと、farman プロセスにロードされたときに qobject_cast や
+#     動的リンク解決に失敗する。QT_VERSION は farman 本体の release.yml と
+#     必ず揃えること (現在 6.10.3)。
+#
+#   ★配布バイナリの実行時リンク (要検証): このワークフローが出す生の成果物は
+#     Qt / libarchive を「ビルド環境のパス」で参照している。farman.app に
+#     ロードさせるには、farman 本体がバンドルしている Qt / libarchive を
+#     参照するよう install name を合わせる必要がある (macOS の @rpath 化など)。
+#     macOS ジョブに best-effort の install_name_tool 書き換えを入れてあるが、
+#     実際の配布 farman.app でのロード可否は必ず実機確認すること。
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. v1.0.0). 手動起動時のみ必須。'
+        required: true
+
+env:
+  # farman 本体 (.github/workflows/release.yml の QT_VERSION) と揃えること。
+  QT_VERSION: 6.10.3
+  BUILD_TYPE: Release
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS (arm64)
+            os: macos-latest
+            qt_host: mac
+            qt_arch: clang_64
+            artifact_name: macos
+          - name: Linux (x86_64)
+            os: ubuntu-22.04
+            qt_host: linux
+            qt_arch: linux_gcc_64
+            artifact_name: linux
+          - name: Windows (x64)
+            os: windows-latest
+            qt_host: windows
+            qt_arch: win64_msvc2022_64
+            artifact_name: windows
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          host: ${{ matrix.qt_host }}
+          target: desktop
+          arch: ${{ matrix.qt_arch }}
+          # qt5compat: Core5Compat (QTextCodec 経由の Shift-JIS 判定で使う)
+          modules: qt5compat
+
+      # ──────── 依存ライブラリ (libarchive) ────────
+      - name: Install libarchive (macOS)
+        if: runner.os == 'macOS'
+        run: brew install libarchive
+
+      - name: Install libarchive (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libarchive-dev
+
+      - name: Install libarchive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          vcpkg install libarchive:x64-windows
+          "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" `
+            | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      # ──────── Configure / Build ────────
+      - name: Configure (Unix)
+        if: runner.os != 'Windows'
+        run: cmake -B build -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
+
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cmake -B build `
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
+
+      - name: Build
+        run: cmake --build build --config ${{ env.BUILD_TYPE }} --parallel 2
+
+      # ──────── 成果物の収集・命名 ────────
+      # ビルド出力先はジェネレータで異なる (単一構成: build/dist/, MSVC 多構成:
+      # build/dist/Release/)。拡張子も OS で違うので find で拾って正規名にする。
+      - name: Collect artifact (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p out
+          f=$(find build -type f \( -name 'LzhArchivePlugin.dylib' -o -name 'LzhArchivePlugin.so' \) | head -1)
+          echo "built: $f"
+          cp "$f" "out/$(basename "$f")"
+
+          # macOS: Qt / libarchive の参照を farman.app がバンドルする形
+          # (@rpath) に合わせる best-effort 書き換え。farman プロセスに既に
+          # 同名でロード済みのフレームワークを再利用させる狙い。実機での
+          # ロード可否は要検証 (README / ワークフロー冒頭コメント参照)。
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            dylib="out/LzhArchivePlugin.dylib"
+            for dep in $(otool -L "$dylib" | awk 'NR>1{print $1}'); do
+              case "$dep" in
+                *QtCore.framework*)
+                  install_name_tool -change "$dep" \
+                    "@rpath/QtCore.framework/Versions/A/QtCore" "$dylib" ;;
+                *QtCore5Compat.framework*)
+                  install_name_tool -change "$dep" \
+                    "@rpath/QtCore5Compat.framework/Versions/A/QtCore5Compat" "$dylib" ;;
+                *libarchive*.dylib)
+                  install_name_tool -change "$dep" \
+                    "@rpath/libarchive.13.dylib" "$dylib" ;;
+              esac
+            done
+            echo "=== rewritten otool -L ==="
+            otool -L "$dylib" || true
+          fi
+
+      - name: Collect artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force out | Out-Null
+          $f = Get-ChildItem -Path build -Recurse -Filter LzhArchivePlugin.dll | Select-Object -First 1
+          Write-Host "built: $($f.FullName)"
+          Copy-Item $f.FullName "out/LzhArchivePlugin.dll"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: out
+          retention-days: 7
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Determine tag
+        id: tag
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Rename artifacts with tag + OS
+        run: |
+          cd dist
+          ls -la */
+          TAG="${{ steps.tag.outputs.tag }}"
+          mv macos/LzhArchivePlugin.dylib   "LzhArchivePlugin-${TAG}-macos-arm64.dylib"
+          mv linux/LzhArchivePlugin.so      "LzhArchivePlugin-${TAG}-linux-x86_64.so"
+          mv windows/LzhArchivePlugin.dll   "LzhArchivePlugin-${TAG}-windows-x64.dll"
+          ls -la
+
+      - name: Generate SHA256 checksums
+        run: |
+          cd dist
+          for f in LzhArchivePlugin-*; do
+            [ -f "$f" ] || continue
+            shasum -a 256 "$f" > "$f.sha256"
+            cat "$f.sha256"
+          done
+
+      - name: Create GitHub Release (draft)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: LZH plugin ${{ steps.tag.outputs.tag }}
+          draft: true
+          prerelease: ${{ contains(steps.tag.outputs.tag, '-') }}
+          generate_release_notes: true
+          files: |
+            dist/LzhArchivePlugin-*-macos-arm64.dylib
+            dist/LzhArchivePlugin-*-macos-arm64.dylib.sha256
+            dist/LzhArchivePlugin-*-linux-x86_64.so
+            dist/LzhArchivePlugin-*-linux-x86_64.so.sha256
+            dist/LzhArchivePlugin-*-windows-x64.dll
+            dist/LzhArchivePlugin-*-windows-x64.dll.sha256
