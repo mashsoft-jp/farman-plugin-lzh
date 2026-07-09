@@ -16,12 +16,12 @@
 #     動的リンク解決に失敗する。QT_VERSION は farman 本体の release.yml と
 #     必ず揃えること (現在 6.10.3)。
 #
-#   ★配布バイナリの実行時リンク (要検証): このワークフローが出す生の成果物は
-#     Qt / libarchive を「ビルド環境のパス」で参照している。farman.app に
-#     ロードさせるには、farman 本体がバンドルしている Qt / libarchive を
-#     参照するよう install name を合わせる必要がある (macOS の @rpath 化など)。
-#     macOS ジョブに best-effort の install_name_tool 書き換えを入れてあるが、
-#     実際の配布 farman.app でのロード可否は必ず実機確認すること。
+#   ★配布バイナリの実行時リンク: ビルド直後の成果物は Qt / libarchive を
+#     「ビルド環境のパス」で参照している。farman.app にロードさせるため、macOS
+#     ジョブで install name を @executable_path/../Frameworks/ に書き換える
+#     (farman が macdeployqt でバンドルするフレームワーク位置。バンドル版
+#     farman.app での実機ロードを確認済み)。Linux/Windows は同名の Qt /
+#     libarchive が farman プロセスに既ロードなら再利用されるため書き換え不要。
 
 name: Release
 
@@ -140,23 +140,28 @@ jobs:
           echo "built: $f"
           cp "$f" "out/$(basename "$f")"
 
-          # macOS: Qt / libarchive の参照を farman.app がバンドルする形
-          # (@rpath) に合わせる best-effort 書き換え。farman プロセスに既に
-          # 同名でロード済みのフレームワークを再利用させる狙い。実機での
-          # ロード可否は要検証 (README / ワークフロー冒頭コメント参照)。
+          # macOS: プラグインの Qt / libarchive 参照を、farman.app が
+          # macdeployqt でバンドルする実ファイル位置 @executable_path/../Frameworks/
+          # に書き換える。@executable_path は「ロードする側の "実行ファイル"
+          # (= farman 本体)」を指すので、外部ディレクトリに置いたプラグインでも
+          # farman.app/Contents/Frameworks/ の既ロード済みフレームワークに解決・
+          # 再利用される (Qt バージョンや framework の install-name id に依存しない)。
+          # ※ @rpath だとプラグイン自身の RPATH で解決されてしまい、farman の
+          #   バンドルには届かないため不可 (実機検証で確認済み)。
           if [ "${{ runner.os }}" = "macOS" ]; then
             dylib="out/LzhArchivePlugin.dylib"
+            fw="@executable_path/../Frameworks"
             for dep in $(otool -L "$dylib" | awk 'NR>1{print $1}'); do
               case "$dep" in
                 *QtCore.framework*)
                   install_name_tool -change "$dep" \
-                    "@rpath/QtCore.framework/Versions/A/QtCore" "$dylib" ;;
+                    "$fw/QtCore.framework/Versions/A/QtCore" "$dylib" ;;
                 *QtCore5Compat.framework*)
                   install_name_tool -change "$dep" \
-                    "@rpath/QtCore5Compat.framework/Versions/A/QtCore5Compat" "$dylib" ;;
+                    "$fw/QtCore5Compat.framework/Versions/A/QtCore5Compat" "$dylib" ;;
                 *libarchive*.dylib)
                   install_name_tool -change "$dep" \
-                    "@rpath/libarchive.13.dylib" "$dylib" ;;
+                    "$fw/libarchive.13.dylib" "$dylib" ;;
               esac
             done
             echo "=== rewritten otool -L ==="
