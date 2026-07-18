@@ -168,6 +168,59 @@ jobs:
             otool -L "$dylib" || true
           fi
 
+      # 署名 + 公証 (macOS)。install_name 書き換えで署名が無効化されるため、
+      # 書き換えの「後」に署名する。MACOS_* secrets が揃っていれば Mashsoft の
+      # Developer ID で署名 + 公証し、ダウンロードした dylib が Gatekeeper の
+      # 「マルウェアを検証できない」で弾かれないようにする。secrets が無ければ
+      # ad-hoc のまま (その場合ユーザーは xattr -dr com.apple.quarantine が必要)。
+      # bare dylib は staple 不可なので、公証済み cdhash のオンライン照合に頼る。
+      - name: Sign and notarize (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          CERT_BASE64:   ${{ secrets.MACOS_CERTIFICATE_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          APPLE_ID:      ${{ secrets.MACOS_NOTARIZATION_APPLE_ID }}
+          TEAM_ID:       ${{ secrets.MACOS_NOTARIZATION_TEAM_ID }}
+          NOTARY_PW:     ${{ secrets.MACOS_NOTARIZATION_PASSWORD }}
+        run: |
+          dylib="out/LzhArchivePlugin.dylib"
+          if [ -z "$CERT_BASE64" ]; then
+            echo "::warning::Developer ID signing NOT available (MACOS_* secrets 未設定)。"
+            echo "ad-hoc のまま配布します。ユーザーは xattr -dr com.apple.quarantine が必要です。"
+            exit 0
+          fi
+
+          # 一時 Keychain に .p12 を import (farman の release.yml と同手順)。
+          CERT_PATH="$RUNNER_TEMP/developer-id.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain"
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
+          echo "$CERT_BASE64" | base64 --decode > "$CERT_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security default-keychain -s "$KEYCHAIN_PATH"
+          security unlock-keychain  -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 7200 "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -k "$KEYCHAIN_PATH" \
+            -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S "apple-tool:,apple:,codesign:" \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" >/dev/null
+          IDENTITY_HASH=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" \
+            | grep "Developer ID Application" | head -n 1 | awk '{print $2}')
+          if [ -z "$IDENTITY_HASH" ]; then
+            echo "::error::Developer ID Application identity not found after import"; exit 1
+          fi
+
+          # Hardened Runtime + secure timestamp で署名 (公証の前提条件)。
+          codesign --force --options runtime --timestamp \
+            --sign "$IDENTITY_HASH" "$dylib"
+          codesign --verify --strict "$dylib"
+
+          # 公証: bare dylib は zip にまとめて notarytool へ提出しオンライン照合。
+          /usr/bin/ditto -c -k "$dylib" "$RUNNER_TEMP/notarize.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+            --apple-id "$APPLE_ID" --team-id "$TEAM_ID" --password "$NOTARY_PW" --wait
+          echo "signed + notarized: $(codesign -dv "$dylib" 2>&1 | grep -i authority | head -1)"
+
       - name: Collect artifact (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
